@@ -39,7 +39,7 @@ function messageTitle(message: any): string {
   return message?.content ? String(message.content).split(/\r?\n/, 1)[0].slice(0, 80) : `traQ message ${message?.id ?? ""}`;
 }
 
-export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number): McpServer {
+export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number, chatGptOnly = false): McpServer {
   const ctx = { config, store, userId, connectionId };
   const server = new McpServer({ name: "traQ MCP", version: "0.1.0" });
 
@@ -82,6 +82,8 @@ export function createMcpServer(config: Config, store: Store, registry: Map<stri
       metadata: { channelId: message?.channelId, userId: message?.userId, createdAt: message?.createdAt }
     });
   });
+
+  if (chatGptOnly) return server;
 
   server.registerTool("traq_get", {
     description: "Call an allowed traQ API v3 GET endpoint.",

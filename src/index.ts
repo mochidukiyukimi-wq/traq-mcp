@@ -65,11 +65,14 @@ app.get("/dashboard", c => {
   const connection = store.latestConnection(user.id);
   const newKey = getCookie(c, "new_mcp_key");
   const mcpUrl = connection?.is_active && newKey ? `${config.publicBaseUrl}/mcp/${newKey}` : "key is hidden; regenerate if needed";
+  const chatGptUrl = connection?.is_active && newKey ? `${config.publicBaseUrl}/chatgpt/${newKey}` : "key is hidden; regenerate if needed";
   return c.html(html(`
     <h1>traQ MCP</h1>
     <p>ユーザー: ${escapeHtml(user.traq_name)}</p>
     <label>MCP Server URL</label>
     <input readonly value="${escapeHtml(mcpUrl)}">
+    <label>ChatGPT Connector URL</label>
+    <input readonly value="${escapeHtml(chatGptUrl)}">
     <p>keyの生値は保存しないため、紛失した場合は再発行してください。</p>
     <form method="post" action="/dashboard/key/regenerate"><button>key再発行</button></form>
     <form method="post" action="/dashboard/key/revoke"><button>key無効化</button></form>
@@ -83,10 +86,13 @@ app.post("/dashboard/key/regenerate", c => {
   if (!user) return c.json({ error: "unauthorized", message: "login required" }, 401);
   const key = store.regenerateConnection(user.id, config.mcpKeyPrefix);
   const mcpUrl = `${config.publicBaseUrl}/mcp/${key}`;
+  const chatGptUrl = `${config.publicBaseUrl}/chatgpt/${key}`;
   return c.html(html(`
     <h1>traQ MCP</h1>
     <p>新しいMCP Server URLです。この画面を離れるとkeyは再表示できません。</p>
     <input readonly value="${escapeHtml(mcpUrl)}">
+    <p>ChatGPT Connector URL</p>
+    <input readonly value="${escapeHtml(chatGptUrl)}">
     <p>このURLを他人に共有しないでください。</p>
     <p><a href="/dashboard">dashboardへ戻る</a></p>
   `));
@@ -99,19 +105,25 @@ app.post("/dashboard/key/revoke", c => {
   return c.redirect("/dashboard");
 });
 
-async function handleMcp(c: Context, key?: string) {
+async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
+  console.info("mcp_request", {
+    path: c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path.startsWith("/chatgpt/") ? "/chatgpt/:key" : c.req.path,
+    method: c.req.method,
+    hasKey: Boolean(key)
+  });
   if (!key) return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
   const connection = store.activeConnectionByKeyHash(hashSecret(key));
   if (!connection) return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
   store.touchConnection(connection.id);
   const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
-  const server = createMcpServer(config, store, registry, connection.user_id, connection.id);
+  const server = createMcpServer(config, store, registry, connection.user_id, connection.id, chatGptOnly);
   await server.connect(transport);
   return transport.handleRequest(c.req.raw);
 }
 
 app.all("/mcp", c => handleMcp(c, c.req.query("key")));
 app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
+app.all("/chatgpt/:key", c => handleMcp(c, c.req.param("key"), true));
 
 app.onError((err, c) => {
   const safeMessage = err instanceof Error ? err.message.split(":")[0] : "unknown";
