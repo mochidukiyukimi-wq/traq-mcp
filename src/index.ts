@@ -179,7 +179,7 @@ async function readRpc(request: Request): Promise<any> {
 
 async function chatGptRpc(request: any, userId: number, connectionId: number, statelessToken?: TokenRow): Promise<any> {
   if (Array.isArray(request)) return Promise.all(request.map(item => chatGptRpc(item, userId, connectionId, statelessToken))).then(items => items.filter(Boolean));
-  if (!request?.id) return undefined;
+  if (request?.id === undefined || request.id === null) return undefined;
   const ctx = { config, store, userId, connectionId, statelessToken };
   if (request.method === "initialize") {
     return rpcResult(request.id, {
