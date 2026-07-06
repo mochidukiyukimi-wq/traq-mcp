@@ -8,7 +8,7 @@ import { hashSecret } from "./crypto.js";
 import { Store } from "./db.js";
 import { createMcpServer } from "./mcp.js";
 import { isBlockedEndpoint, loadRegistry } from "./registry.js";
-import { exchangeCode, getMe, tokenRow } from "./traq.js";
+import { exchangeCode, getMe, hasReadScope, tokenRow } from "./traq.js";
 
 const config = loadConfig();
 const store = new Store(config.databasePath);
@@ -42,7 +42,7 @@ app.get("/auth/traq/callback", async c => {
   const state = c.req.query("state");
   if (!code || !state || state !== getCookie(c, "oauth_state")) return c.json({ error: "unauthorized", message: "invalid OAuth state" }, 401);
   const token = await exchangeCode(config, code);
-  if ((token.scope ?? "read") !== "read") return c.json({ error: "unauthorized", message: "unexpected OAuth scope" }, 401);
+  if (!hasReadScope(token.scope)) return c.json({ error: "unauthorized", message: "unexpected OAuth scope" }, 401);
   const me = await getMe(config, token.access_token);
   const user = store.upsertUser(me.id, me.name ?? me.displayName ?? me.id);
   store.saveTokens(tokenRow(config, user.id, token));
@@ -112,6 +112,8 @@ app.all("/mcp", async c => {
 });
 
 app.onError((err, c) => {
+  const safeMessage = err instanceof Error ? err.message.split(":")[0] : "unknown";
+  console.error("request_failed", { path: c.req.path, error: safeMessage });
   const message = err instanceof Error && err.message === "reauth_required"
     ? { error: "reauth_required", message: "traQ OAuth token refresh failed. Please register again." }
     : { error: "internal_server_error", message: "internal server error" };

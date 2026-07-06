@@ -12,8 +12,8 @@ export type TraqContext = {
 
 type OAuthTokenResponse = {
   access_token: string;
-  refresh_token: string;
-  expires_in: number;
+  refresh_token?: string;
+  expires_in?: number;
   scope?: string;
 };
 
@@ -30,7 +30,7 @@ export async function exchangeCode(config: Config, code: string): Promise<OAuthT
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body
   });
-  if (!response.ok) throw new Error(`traQ OAuth token exchange failed: ${response.status}`);
+  if (!response.ok) throw new Error(`oauth_token_exchange_failed:${response.status}`);
   return response.json() as Promise<OAuthTokenResponse>;
 }
 
@@ -50,12 +50,18 @@ export async function refreshAccessToken(config: Config, refreshToken: string): 
   return response.json() as Promise<OAuthTokenResponse>;
 }
 
-export function tokenRow(config: Config, userId: number, token: OAuthTokenResponse): TokenRow {
+export function hasReadScope(scope?: string): boolean {
+  return (scope ?? "read").split(/\s+/).includes("read");
+}
+
+export function tokenRow(config: Config, userId: number, token: OAuthTokenResponse, previous?: TokenRow): TokenRow {
+  const refreshToken = token.refresh_token ?? (previous ? decryptText(config.tokenEncryptionKey, previous.refresh_token_encrypted) : undefined);
+  if (!refreshToken) throw new Error("oauth_refresh_token_missing");
   return {
     user_id: userId,
     access_token_encrypted: encryptText(config.tokenEncryptionKey, token.access_token),
-    refresh_token_encrypted: encryptText(config.tokenEncryptionKey, token.refresh_token),
-    expires_at: new Date(Date.now() + token.expires_in * 1000).toISOString(),
+    refresh_token_encrypted: encryptText(config.tokenEncryptionKey, refreshToken),
+    expires_at: new Date(Date.now() + (token.expires_in ?? 3600) * 1000).toISOString(),
     scope: token.scope ?? "read"
   };
 }
@@ -66,7 +72,7 @@ async function accessToken(ctx: TraqContext): Promise<string> {
     return decryptText(ctx.config.tokenEncryptionKey, row.access_token_encrypted);
   }
   const refreshed = await refreshAccessToken(ctx.config, decryptText(ctx.config.tokenEncryptionKey, row.refresh_token_encrypted));
-  ctx.store.saveTokens(tokenRow(ctx.config, ctx.userId, refreshed));
+  ctx.store.saveTokens(tokenRow(ctx.config, ctx.userId, refreshed, row));
   return refreshed.access_token;
 }
 

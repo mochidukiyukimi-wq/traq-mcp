@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { buildRegistry, fillPath, isBlockedEndpoint } from "./registry.js";
+import { hasReadScope } from "./traq.js";
 
 const registry = buildRegistry({
   paths: {
@@ -18,4 +19,7 @@ assert.equal(registry.has("/clients/{clientId}"), false);
 assert.equal(registry.has("/messages"), false);
 assert.equal(isBlockedEndpoint("/oauth2/token"), true);
 assert.equal(fillPath("/channels/{channelId}/messages", { channelId: "a b" }), "/channels/a%20b/messages");
+assert.equal(hasReadScope("read"), true);
+assert.equal(hasReadScope("openid read"), true);
+assert.equal(hasReadScope("write"), false);
 console.log("selfcheck ok");
