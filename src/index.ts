@@ -64,7 +64,7 @@ app.get("/dashboard", c => {
   if (!user) return c.redirect("/");
   const connection = store.latestConnection(user.id);
   const newKey = getCookie(c, "new_mcp_key");
-  const mcpUrl = connection?.is_active && newKey ? `${config.publicBaseUrl}/mcp?key=${newKey}` : "key is hidden; regenerate if needed";
+  const mcpUrl = connection?.is_active && newKey ? `${config.publicBaseUrl}/mcp/${newKey}` : "key is hidden; regenerate if needed";
   return c.html(html(`
     <h1>traQ MCP</h1>
     <p>ユーザー: ${escapeHtml(user.traq_name)}</p>
@@ -82,7 +82,7 @@ app.post("/dashboard/key/regenerate", c => {
   const user = currentUser(c);
   if (!user) return c.json({ error: "unauthorized", message: "login required" }, 401);
   const key = store.regenerateConnection(user.id, config.mcpKeyPrefix);
-  const mcpUrl = `${config.publicBaseUrl}/mcp?key=${key}`;
+  const mcpUrl = `${config.publicBaseUrl}/mcp/${key}`;
   return c.html(html(`
     <h1>traQ MCP</h1>
     <p>新しいMCP Server URLです。この画面を離れるとkeyは再表示できません。</p>
@@ -99,8 +99,7 @@ app.post("/dashboard/key/revoke", c => {
   return c.redirect("/dashboard");
 });
 
-app.all("/mcp", async c => {
-  const key = c.req.query("key");
+async function handleMcp(c: Context, key?: string) {
   if (!key) return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
   const connection = store.activeConnectionByKeyHash(hashSecret(key));
   if (!connection) return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
@@ -109,11 +108,14 @@ app.all("/mcp", async c => {
   const server = createMcpServer(config, store, registry, connection.user_id, connection.id);
   await server.connect(transport);
   return transport.handleRequest(c.req.raw);
-});
+}
+
+app.all("/mcp", c => handleMcp(c, c.req.query("key")));
+app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
 
 app.onError((err, c) => {
   const safeMessage = err instanceof Error ? err.message.split(":")[0] : "unknown";
-  console.error("request_failed", { path: c.req.path, error: safeMessage });
+  console.error("request_failed", { path: c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path, error: safeMessage });
   const message = err instanceof Error && err.message === "reauth_required"
     ? { error: "reauth_required", message: "traQ OAuth token refresh failed. Please register again." }
     : { error: "internal_server_error", message: "internal server error" };
