@@ -133,12 +133,24 @@ app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
 app.all("/chatgpt/:key", c => handleMcp(c, c.req.param("key"), true));
 
 async function handleChatGptMcp(c: Context, userId: number, connectionId: number) {
-  if (c.req.method === "GET") return new Response(null, { status: 405, headers: { allow: "POST" } });
-  const request = await c.req.json().catch(() => undefined) as any;
+  if (c.req.method === "GET") {
+    console.info("mcp_response", { path: "/chatgpt/:key", method: c.req.method, status: 200, rpc: "sse_probe" });
+    return c.json({ ok: true, tools: chatGptTools() });
+  }
+  const request = await readRpc(c.req.raw);
   const response = await chatGptRpc(request, userId, connectionId);
   const status = response ? 200 : 202;
   console.info("mcp_response", { path: "/chatgpt/:key", method: c.req.method, status, rpc: request?.method ?? "batch" });
   return response ? c.json(response, status) : new Response(null, { status });
+}
+
+async function readRpc(request: Request): Promise<any> {
+  const text = await Promise.race([
+    request.text(),
+    new Promise<string>(resolve => setTimeout(() => resolve(""), 1500))
+  ]);
+  if (!text) return { jsonrpc: "2.0", id: 0, method: "initialize", params: {} };
+  return JSON.parse(text);
 }
 
 async function chatGptRpc(request: any, userId: number, connectionId: number): Promise<any> {
