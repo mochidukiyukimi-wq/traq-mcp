@@ -8,6 +8,7 @@ export type TraqContext = {
   store: Store;
   userId: number;
   connectionId: number;
+  statelessToken?: TokenRow;
 };
 
 type OAuthTokenResponse = {
@@ -66,14 +67,14 @@ export function tokenRow(config: Config, userId: number, token: OAuthTokenRespon
 }
 
 async function accessToken(ctx: TraqContext): Promise<string> {
-  const row = ctx.store.getTokens(ctx.userId);
+  const row = ctx.statelessToken ?? ctx.store.getTokens(ctx.userId);
   if (Date.parse(row.expires_at) > Date.now() + 60_000) {
     return decryptText(ctx.config.tokenEncryptionKey, row.access_token_encrypted);
   }
   const refreshToken = decryptText(ctx.config.tokenEncryptionKey, row.refresh_token_encrypted);
   if (!refreshToken) throw new Error("reauth_required");
   const refreshed = await refreshAccessToken(ctx.config, refreshToken);
-  ctx.store.saveTokens(tokenRow(ctx.config, ctx.userId, refreshed, row));
+  if (!ctx.statelessToken) ctx.store.saveTokens(tokenRow(ctx.config, ctx.userId, refreshed, row));
   return refreshed.access_token;
 }
 

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 import type { Config } from "./config.js";
-import type { Store } from "./db.js";
+import type { Store, TokenRow } from "./db.js";
 import { isBlockedEndpoint, publicEndpoint, type Endpoint } from "./registry.js";
 import { traqGet, type TraqContext } from "./traq.js";
 
@@ -63,8 +63,8 @@ export async function fetchMessage(ctx: TraqContext, registry: Map<string, Endpo
   };
 }
 
-export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number, chatGptOnly = false): McpServer {
-  const ctx = { config, store, userId, connectionId };
+export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number, chatGptOnly = false, statelessToken?: TokenRow): McpServer {
+  const ctx = { config, store, userId, connectionId, statelessToken };
   const server = new McpServer({ name: "traQ MCP", version: "0.1.0" });
 
   server.registerTool("search", {

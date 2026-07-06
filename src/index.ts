@@ -4,8 +4,8 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { Hono, type Context } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
 import { loadConfig } from "./config.js";
-import { hashSecret } from "./crypto.js";
-import { Store } from "./db.js";
+import { decryptText, encryptText, hashSecret } from "./crypto.js";
+import { Store, type TokenRow } from "./db.js";
 import { createMcpServer, fetchMessage, searchMessages } from "./mcp.js";
 import { isBlockedEndpoint, loadRegistry } from "./registry.js";
 import { exchangeCode, getMe, hasReadScope, tokenRow } from "./traq.js";
@@ -45,12 +45,15 @@ app.get("/auth/traq/callback", async c => {
   if (!hasReadScope(token.scope)) return c.json({ error: "unauthorized", message: "unexpected OAuth scope" }, 401);
   const me = await getMe(config, token.access_token);
   const user = store.upsertUser(me.id, me.name ?? me.displayName ?? me.id);
-  store.saveTokens(tokenRow(config, user.id, token));
+  const row = tokenRow(config, user.id, token);
+  store.saveTokens(row);
   const key = store.latestConnection(user.id) ? undefined : store.createConnection(user.id, config.mcpKeyPrefix);
+  const sealedKey = sealConnection(row);
   const session = randomBytes(32).toString("base64url");
   store.createWebSession(user.id, session);
   setCookie(c, "session", session, { httpOnly: true, secure: secureCookie, sameSite: "Lax", path: "/" });
   if (key) setCookie(c, "new_mcp_key", key, { httpOnly: true, secure: secureCookie, sameSite: "Lax", path: "/dashboard", maxAge: 300 });
+  setCookie(c, "sealed_mcp_key", sealedKey, { httpOnly: true, secure: secureCookie, sameSite: "Lax", path: "/dashboard", maxAge: 300 });
   return c.redirect("/dashboard");
 });
 
@@ -64,8 +67,10 @@ app.get("/dashboard", c => {
   if (!user) return c.redirect("/");
   const connection = store.latestConnection(user.id);
   const newKey = getCookie(c, "new_mcp_key");
-  const mcpUrl = connection?.is_active && newKey ? `${config.publicBaseUrl}/mcp/${newKey}` : "key is hidden; regenerate if needed";
-  const chatGptUrl = connection?.is_active && newKey ? `${config.publicBaseUrl}/chatgpt/${newKey}` : "key is hidden; regenerate if needed";
+  const sealedKey = getCookie(c, "sealed_mcp_key");
+  const visibleKey = sealedKey ?? (connection?.is_active ? newKey : undefined);
+  const mcpUrl = visibleKey ? `${config.publicBaseUrl}/mcp/${visibleKey}` : "key is hidden; register again if needed";
+  const chatGptUrl = visibleKey ? `${config.publicBaseUrl}/chatgpt/${visibleKey}` : "key is hidden; register again if needed";
   return c.html(html(`
     <h1>traQ MCP</h1>
     <p>ユーザー: ${escapeHtml(user.traq_name)}</p>
@@ -84,7 +89,8 @@ app.get("/dashboard", c => {
 app.post("/dashboard/key/regenerate", c => {
   const user = currentUser(c);
   if (!user) return c.json({ error: "unauthorized", message: "login required" }, 401);
-  const key = store.regenerateConnection(user.id, config.mcpKeyPrefix);
+  store.regenerateConnection(user.id, config.mcpKeyPrefix);
+  const key = sealConnection(store.getTokens(user.id));
   const mcpUrl = `${config.publicBaseUrl}/mcp/${key}`;
   const chatGptUrl = `${config.publicBaseUrl}/chatgpt/${key}`;
   return c.html(html(`
@@ -116,10 +122,20 @@ async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
     console.info("mcp_response", { path: safePath, method: c.req.method, status: 401, auth: "missing_key" });
     return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
   }
-  const connection = store.activeConnectionByKeyHash(hashSecret(key));
+  const sealed = openSealedConnection(key);
+  const connection = sealed ? undefined : store.activeConnectionByKeyHash(hashSecret(key));
   if (!connection) {
-    console.info("mcp_response", { path: safePath, method: c.req.method, status: 401, auth: "invalid_key" });
-    return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
+    if (!sealed) {
+      console.info("mcp_response", { path: safePath, method: c.req.method, status: 401, auth: "invalid_key" });
+      return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
+    }
+    if (chatGptOnly) return handleChatGptMcp(c, 0, 0, sealed);
+    const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
+    const server = createMcpServer(config, store, registry, 0, 0, chatGptOnly, sealed);
+    await server.connect(transport);
+    const response = await transport.handleRequest(mcpRequest(c.req.raw));
+    console.info("mcp_response", { path: safePath, method: c.req.method, status: response.status, auth: "sealed" });
+    return response;
   }
   store.touchConnection(connection.id);
   if (chatGptOnly) return handleChatGptMcp(c, connection.user_id, connection.id);
@@ -140,13 +156,13 @@ app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
 app.options("/chatgpt/:key", c => new Response(null, { status: 204 }));
 app.all("/chatgpt/:key", c => handleMcp(c, c.req.param("key"), true));
 
-async function handleChatGptMcp(c: Context, userId: number, connectionId: number) {
+async function handleChatGptMcp(c: Context, userId: number, connectionId: number, statelessToken?: TokenRow) {
   if (c.req.method === "GET") {
     console.info("mcp_response", { path: "/chatgpt/:key", method: c.req.method, status: 200, rpc: "sse_probe" });
     return c.json({ ok: true, tools: chatGptTools() });
   }
   const request = await readRpc(c.req.raw);
-  const response = await chatGptRpc(request, userId, connectionId);
+  const response = await chatGptRpc(request, userId, connectionId, statelessToken);
   const status = response ? 200 : 202;
   console.info("mcp_response", { path: "/chatgpt/:key", method: c.req.method, status, rpc: request?.method ?? "batch" });
   return response ? c.json(response, status) : new Response(null, { status });
@@ -161,10 +177,10 @@ async function readRpc(request: Request): Promise<any> {
   return JSON.parse(text);
 }
 
-async function chatGptRpc(request: any, userId: number, connectionId: number): Promise<any> {
-  if (Array.isArray(request)) return Promise.all(request.map(item => chatGptRpc(item, userId, connectionId))).then(items => items.filter(Boolean));
+async function chatGptRpc(request: any, userId: number, connectionId: number, statelessToken?: TokenRow): Promise<any> {
+  if (Array.isArray(request)) return Promise.all(request.map(item => chatGptRpc(item, userId, connectionId, statelessToken))).then(items => items.filter(Boolean));
   if (!request?.id) return undefined;
-  const ctx = { config, store, userId, connectionId };
+  const ctx = { config, store, userId, connectionId, statelessToken };
   if (request.method === "initialize") {
     return rpcResult(request.id, {
       protocolVersion: request.params?.protocolVersion ?? "2025-03-26",
@@ -207,6 +223,20 @@ function chatGptTools() {
       annotations: { readOnlyHint: true }
     }
   ];
+}
+
+function sealConnection(row: TokenRow): string {
+  return `${config.mcpKeyPrefix}sealed_${encryptText(config.tokenEncryptionKey, JSON.stringify(row))}`;
+}
+
+function openSealedConnection(key: string): TokenRow | undefined {
+  const prefix = `${config.mcpKeyPrefix}sealed_`;
+  if (!key.startsWith(prefix)) return undefined;
+  try {
+    return JSON.parse(decryptText(config.tokenEncryptionKey, key.slice(prefix.length))) as TokenRow;
+  } catch {
+    return undefined;
+  }
 }
 
 function mcpRequest(request: Request): Request {

@@ -134,6 +134,6 @@ export class Store {
 
   logTool(connectionId: number, toolName: string, path: string | undefined, status?: number, resultCount?: number): void {
     this.db.prepare("insert into audit_logs (connection_id, tool_name, path, status, result_count) values (?, ?, ?, ?, ?)")
-      .run(connectionId, toolName, path ?? null, status ?? null, resultCount ?? null);
+      .run(connectionId > 0 ? connectionId : null, toolName, path ?? null, status ?? null, resultCount ?? null);
   }
 }
