@@ -55,8 +55,7 @@ export function hasReadScope(scope?: string): boolean {
 }
 
 export function tokenRow(config: Config, userId: number, token: OAuthTokenResponse, previous?: TokenRow): TokenRow {
-  const refreshToken = token.refresh_token ?? (previous ? decryptText(config.tokenEncryptionKey, previous.refresh_token_encrypted) : undefined);
-  if (!refreshToken) throw new Error("oauth_refresh_token_missing");
+  const refreshToken = token.refresh_token ?? (previous ? decryptText(config.tokenEncryptionKey, previous.refresh_token_encrypted) : "");
   return {
     user_id: userId,
     access_token_encrypted: encryptText(config.tokenEncryptionKey, token.access_token),
@@ -71,7 +70,9 @@ async function accessToken(ctx: TraqContext): Promise<string> {
   if (Date.parse(row.expires_at) > Date.now() + 60_000) {
     return decryptText(ctx.config.tokenEncryptionKey, row.access_token_encrypted);
   }
-  const refreshed = await refreshAccessToken(ctx.config, decryptText(ctx.config.tokenEncryptionKey, row.refresh_token_encrypted));
+  const refreshToken = decryptText(ctx.config.tokenEncryptionKey, row.refresh_token_encrypted);
+  if (!refreshToken) throw new Error("reauth_required");
+  const refreshed = await refreshAccessToken(ctx.config, refreshToken);
   ctx.store.saveTokens(tokenRow(ctx.config, ctx.userId, refreshed, row));
   return refreshed.access_token;
 }
