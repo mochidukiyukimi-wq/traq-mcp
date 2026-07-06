@@ -6,7 +6,7 @@ import { getCookie, setCookie } from "hono/cookie";
 import { loadConfig } from "./config.js";
 import { hashSecret } from "./crypto.js";
 import { Store } from "./db.js";
-import { createMcpServer } from "./mcp.js";
+import { createMcpServer, fetchMessage, searchMessages } from "./mcp.js";
 import { isBlockedEndpoint, loadRegistry } from "./registry.js";
 import { exchangeCode, getMe, hasReadScope, tokenRow } from "./traq.js";
 
@@ -115,6 +115,7 @@ async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
   const connection = store.activeConnectionByKeyHash(hashSecret(key));
   if (!connection) return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
   store.touchConnection(connection.id);
+  if (chatGptOnly) return handleChatGptMcp(c, connection.user_id, connection.id);
   const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
   const server = createMcpServer(config, store, registry, connection.user_id, connection.id, chatGptOnly);
   await server.connect(transport);
@@ -130,6 +131,63 @@ async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
 app.all("/mcp", c => handleMcp(c, c.req.query("key")));
 app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
 app.all("/chatgpt/:key", c => handleMcp(c, c.req.param("key"), true));
+
+async function handleChatGptMcp(c: Context, userId: number, connectionId: number) {
+  if (c.req.method === "GET") return new Response(null, { status: 405, headers: { allow: "POST" } });
+  const request = await c.req.json().catch(() => undefined) as any;
+  const response = await chatGptRpc(request, userId, connectionId);
+  const status = response ? 200 : 202;
+  console.info("mcp_response", { path: "/chatgpt/:key", method: c.req.method, status, rpc: request?.method ?? "batch" });
+  return response ? c.json(response, status) : new Response(null, { status });
+}
+
+async function chatGptRpc(request: any, userId: number, connectionId: number): Promise<any> {
+  if (Array.isArray(request)) return Promise.all(request.map(item => chatGptRpc(item, userId, connectionId))).then(items => items.filter(Boolean));
+  if (!request?.id) return undefined;
+  const ctx = { config, store, userId, connectionId };
+  if (request.method === "initialize") {
+    return rpcResult(request.id, {
+      protocolVersion: request.params?.protocolVersion ?? "2025-03-26",
+      capabilities: { tools: {} },
+      serverInfo: { name: "traQ MCP", version: "0.1.0" }
+    });
+  }
+  if (request.method === "tools/list") return rpcResult(request.id, { tools: chatGptTools() });
+  if (request.method === "tools/call") {
+    const name = request.params?.name;
+    const args = request.params?.arguments ?? {};
+    const data = name === "search"
+      ? await searchMessages(ctx, registry, String(args.query ?? ""))
+      : name === "fetch"
+        ? await fetchMessage(ctx, registry, String(args.id ?? ""))
+        : { error: "tool_not_found" };
+    return rpcResult(request.id, { structuredContent: data, content: [{ type: "text", text: JSON.stringify(data) }] });
+  }
+  return { jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } };
+}
+
+function rpcResult(id: unknown, result: unknown) {
+  return { jsonrpc: "2.0", id, result };
+}
+
+function chatGptTools() {
+  return [
+    {
+      name: "search",
+      description: "Search traQ messages.",
+      inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { results: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" } }, required: ["id", "title", "url"], additionalProperties: false } } }, required: ["results"], additionalProperties: false },
+      annotations: { readOnlyHint: true }
+    },
+    {
+      name: "fetch",
+      description: "Fetch one traQ message by ID.",
+      inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, text: { type: "string" }, url: { type: "string" }, metadata: { type: "object" } }, required: ["id", "title", "text", "url"], additionalProperties: false },
+      annotations: { readOnlyHint: true }
+    }
+  ];
+}
 
 function mcpRequest(request: Request): Request {
   const headers = new Headers(request.headers);

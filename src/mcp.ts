@@ -39,6 +39,30 @@ function messageTitle(message: any): string {
   return message?.content ? String(message.content).split(/\r?\n/, 1)[0].slice(0, 80) : `traQ message ${message?.id ?? ""}`;
 }
 
+export async function searchMessages(ctx: TraqContext, registry: Map<string, Endpoint>, query: string) {
+  const endpoint = registry.get("/messages");
+  if (!endpoint) return { results: [] };
+  const result = await traqGet(ctx, endpoint, {}, { word: query, limit: 10 });
+  ctx.store.logTool(ctx.connectionId, "search", "/messages", result.status, result.resultCount);
+  const hits = Array.isArray((result.body as any)?.hits) ? (result.body as any).hits : [];
+  return { results: hits.map((m: any) => ({ id: String(m.id), title: messageTitle(m), url: messageUrl(String(m.id)) })) };
+}
+
+export async function fetchMessage(ctx: TraqContext, registry: Map<string, Endpoint>, id: string) {
+  const endpoint = registry.get("/messages/{messageId}");
+  if (!endpoint) return { id, title: `traQ message ${id}`, text: "message endpoint is not available", url: messageUrl(id) };
+  const result = await traqGet(ctx, endpoint, { messageId: id }, {});
+  ctx.store.logTool(ctx.connectionId, "fetch", "/messages/{messageId}", result.status, result.resultCount);
+  const message = result.body as any;
+  return {
+    id,
+    title: messageTitle(message),
+    text: typeof message?.content === "string" ? message.content : JSON.stringify(message),
+    url: messageUrl(id),
+    metadata: { channelId: message?.channelId, userId: message?.userId, createdAt: message?.createdAt }
+  };
+}
+
 export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number, chatGptOnly = false): McpServer {
   const ctx = { config, store, userId, connectionId };
   const server = new McpServer({ name: "traQ MCP", version: "0.1.0" });
@@ -49,12 +73,7 @@ export function createMcpServer(config: Config, store: Store, registry: Map<stri
     outputSchema: { results: z.array(z.object({ id: z.string(), title: z.string(), url: z.string() })) },
     annotations: readOnly
   }, async ({ query }) => {
-    const endpoint = registry.get("/messages");
-    if (!endpoint) return structured({ results: [] });
-    const result = await traqGet(ctx, endpoint, {}, { word: query, limit: 10 });
-    ctx.store.logTool(ctx.connectionId, "search", "/messages", result.status, result.resultCount);
-    const hits = Array.isArray((result.body as any)?.hits) ? (result.body as any).hits : [];
-    return structured({ results: hits.map((m: any) => ({ id: String(m.id), title: messageTitle(m), url: messageUrl(String(m.id)) })) });
+    return structured(await searchMessages(ctx, registry, query));
   });
 
   server.registerTool("fetch", {
@@ -69,18 +88,7 @@ export function createMcpServer(config: Config, store: Store, registry: Map<stri
     },
     annotations: readOnly
   }, async ({ id }) => {
-    const endpoint = registry.get("/messages/{messageId}");
-    if (!endpoint) return structured({ id, title: `traQ message ${id}`, text: "message endpoint is not available", url: messageUrl(id) });
-    const result = await traqGet(ctx, endpoint, { messageId: id }, {});
-    ctx.store.logTool(ctx.connectionId, "fetch", "/messages/{messageId}", result.status, result.resultCount);
-    const message = result.body as any;
-    return structured({
-      id,
-      title: messageTitle(message),
-      text: typeof message?.content === "string" ? message.content : JSON.stringify(message),
-      url: messageUrl(id),
-      metadata: { channelId: message?.channelId, userId: message?.userId, createdAt: message?.createdAt }
-    });
+    return structured(await fetchMessage(ctx, registry, id));
   });
 
   if (chatGptOnly) return server;
