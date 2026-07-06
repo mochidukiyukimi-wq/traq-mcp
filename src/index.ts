@@ -106,14 +106,21 @@ app.post("/dashboard/key/revoke", c => {
 });
 
 async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
+  const safePath = c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path.startsWith("/chatgpt/") ? "/chatgpt/:key" : c.req.path;
   console.info("mcp_request", {
-    path: c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path.startsWith("/chatgpt/") ? "/chatgpt/:key" : c.req.path,
+    path: safePath,
     method: c.req.method,
     hasKey: Boolean(key)
   });
-  if (!key) return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
+  if (!key) {
+    console.info("mcp_response", { path: safePath, method: c.req.method, status: 401, auth: "missing_key" });
+    return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
+  }
   const connection = store.activeConnectionByKeyHash(hashSecret(key));
-  if (!connection) return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
+  if (!connection) {
+    console.info("mcp_response", { path: safePath, method: c.req.method, status: 401, auth: "invalid_key" });
+    return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
+  }
   store.touchConnection(connection.id);
   if (chatGptOnly) return handleChatGptMcp(c, connection.user_id, connection.id);
   const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
@@ -130,6 +137,7 @@ async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
 
 app.all("/mcp", c => handleMcp(c, c.req.query("key")));
 app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
+app.options("/chatgpt/:key", c => new Response(null, { status: 204 }));
 app.all("/chatgpt/:key", c => handleMcp(c, c.req.param("key"), true));
 
 async function handleChatGptMcp(c: Context, userId: number, connectionId: number) {
