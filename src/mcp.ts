@@ -6,6 +6,10 @@ import { isBlockedEndpoint, publicEndpoint, type Endpoint } from "./registry.js"
 import { traqGet, type TraqContext } from "./traq.js";
 
 const json = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] });
+const structured = (value: Record<string, unknown>) => ({
+  structuredContent: value,
+  content: [{ type: "text" as const, text: JSON.stringify(value) }]
+});
 
 const genericInput = {
   path: z.string(),
@@ -29,9 +33,55 @@ async function callTraqGet(ctx: TraqContext, registry: Map<string, Endpoint>, to
   return json({ data: result.body, meta: { path, query, returned: result.resultCount } });
 }
 
+const messageUrl = (id: string) => `https://q.trap.jp/messages/${encodeURIComponent(id)}`;
+
+function messageTitle(message: any): string {
+  return message?.content ? String(message.content).split(/\r?\n/, 1)[0].slice(0, 80) : `traQ message ${message?.id ?? ""}`;
+}
+
 export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number): McpServer {
   const ctx = { config, store, userId, connectionId };
   const server = new McpServer({ name: "traQ MCP", version: "0.1.0" });
+
+  server.registerTool("search", {
+    description: "Search traQ messages. Required compatibility tool for ChatGPT connectors.",
+    inputSchema: { query: z.string() },
+    outputSchema: { results: z.array(z.object({ id: z.string(), title: z.string(), url: z.string() })) },
+    annotations: readOnly
+  }, async ({ query }) => {
+    const endpoint = registry.get("/messages");
+    if (!endpoint) return structured({ results: [] });
+    const result = await traqGet(ctx, endpoint, {}, { word: query, limit: 10 });
+    ctx.store.logTool(ctx.connectionId, "search", "/messages", result.status, result.resultCount);
+    const hits = Array.isArray((result.body as any)?.hits) ? (result.body as any).hits : [];
+    return structured({ results: hits.map((m: any) => ({ id: String(m.id), title: messageTitle(m), url: messageUrl(String(m.id)) })) });
+  });
+
+  server.registerTool("fetch", {
+    description: "Fetch one traQ message by ID. Required compatibility tool for ChatGPT connectors.",
+    inputSchema: { id: z.string() },
+    outputSchema: {
+      id: z.string(),
+      title: z.string(),
+      text: z.string(),
+      url: z.string(),
+      metadata: z.record(z.string(), z.unknown()).optional()
+    },
+    annotations: readOnly
+  }, async ({ id }) => {
+    const endpoint = registry.get("/messages/{messageId}");
+    if (!endpoint) return structured({ id, title: `traQ message ${id}`, text: "message endpoint is not available", url: messageUrl(id) });
+    const result = await traqGet(ctx, endpoint, { messageId: id }, {});
+    ctx.store.logTool(ctx.connectionId, "fetch", "/messages/{messageId}", result.status, result.resultCount);
+    const message = result.body as any;
+    return structured({
+      id,
+      title: messageTitle(message),
+      text: typeof message?.content === "string" ? message.content : JSON.stringify(message),
+      url: messageUrl(id),
+      metadata: { channelId: message?.channelId, userId: message?.userId, createdAt: message?.createdAt }
+    });
+  });
 
   server.registerTool("traq_get", {
     description: "Call an allowed traQ API v3 GET endpoint.",
