@@ -118,12 +118,25 @@ async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
   const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
   const server = createMcpServer(config, store, registry, connection.user_id, connection.id, chatGptOnly);
   await server.connect(transport);
-  return transport.handleRequest(c.req.raw);
+  const response = await transport.handleRequest(mcpRequest(c.req.raw));
+  console.info("mcp_response", {
+    path: c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path.startsWith("/chatgpt/") ? "/chatgpt/:key" : c.req.path,
+    method: c.req.method,
+    status: response.status
+  });
+  return response;
 }
 
 app.all("/mcp", c => handleMcp(c, c.req.query("key")));
 app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
 app.all("/chatgpt/:key", c => handleMcp(c, c.req.param("key"), true));
+
+function mcpRequest(request: Request): Request {
+  const headers = new Headers(request.headers);
+  if (request.method === "POST") headers.set("accept", "application/json, text/event-stream");
+  if (request.method === "GET") headers.set("accept", "text/event-stream");
+  return new Request(request, { headers });
+}
 
 app.onError((err, c) => {
   const safeMessage = err instanceof Error ? err.message.split(":")[0] : "unknown";
