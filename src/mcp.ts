@@ -39,6 +39,21 @@ function messageTitle(message: any): string {
   return message?.content ? String(message.content).split(/\r?\n/, 1)[0].slice(0, 80) : `traQ message ${message?.id ?? ""}`;
 }
 
+type ChannelSummary = { id: string; name: string; path: string; parentId?: string };
+
+export function flattenChannels(body: unknown): ChannelSummary[] {
+  const rows = Array.isArray(body) ? body : Object.values((body ?? {}) as Record<string, unknown>).flatMap(value => Array.isArray(value) ? value : []);
+  const channels = rows
+    .filter((item: any) => item?.id && item?.name)
+    .map((item: any) => ({ id: String(item.id), name: String(item.name), parentId: item.parentId ? String(item.parentId) : undefined }));
+  const byId = new Map(channels.map(channel => [channel.id, channel]));
+  const pathOf = (channel: { id: string; name: string; parentId?: string }): string => {
+    const parent = channel.parentId ? byId.get(channel.parentId) : undefined;
+    return parent ? `${pathOf(parent)}/${channel.name}` : channel.name;
+  };
+  return channels.map(channel => ({ ...channel, path: pathOf(channel) }));
+}
+
 export async function searchMessages(ctx: TraqContext, registry: Map<string, Endpoint>, query: string) {
   const endpoint = registry.get("/messages");
   if (!endpoint) return { results: [] };
@@ -63,7 +78,21 @@ export async function fetchMessage(ctx: TraqContext, registry: Map<string, Endpo
   };
 }
 
+export async function findChannels(ctx: TraqContext, registry: Map<string, Endpoint>, query: string, limit = 10) {
+  const endpoint = registry.get("/channels");
+  if (!endpoint) return { channels: [] };
+  const result = await traqGet(ctx, endpoint, {}, {});
+  ctx.store.logTool(ctx.connectionId, "find_channels", "/channels", result.status, result.resultCount);
+  const needle = query.toLowerCase().replace(/^#|^\//, "");
+  return {
+    channels: flattenChannels(result.body)
+      .filter(channel => !needle || channel.id === query || channel.name.toLowerCase().includes(needle) || channel.path.toLowerCase().includes(needle))
+      .slice(0, limit)
+  };
+}
+
 export async function listChannelMessages(ctx: TraqContext, registry: Map<string, Endpoint>, channelId: string, query: Record<string, string | number | boolean | undefined> = {}) {
+  if (!channelId) return { messages: [], status: 404, error: "channel_not_found" };
   const endpoint = registry.get("/channels/{channelId}/messages");
   if (!endpoint) return { messages: [] };
   const result = await traqGet(ctx, endpoint, { channelId }, query);

@@ -6,7 +6,7 @@ import { getCookie, setCookie } from "hono/cookie";
 import { loadConfig } from "./config.js";
 import { decryptText, encryptText, hashSecret } from "./crypto.js";
 import { Store, type TokenRow } from "./db.js";
-import { createMcpServer, fetchMessage, listChannelMessages, searchMessages } from "./mcp.js";
+import { createMcpServer, fetchMessage, findChannels, listChannelMessages, searchMessages } from "./mcp.js";
 import { isBlockedEndpoint, loadRegistry } from "./registry.js";
 import { exchangeCode, getMe, hasReadScope, tokenRow } from "./traq.js";
 
@@ -196,8 +196,10 @@ async function chatGptRpc(request: any, userId: number, connectionId: number, st
       ? await searchMessages(ctx, registry, String(args.query ?? ""))
       : name === "fetch"
         ? await fetchMessage(ctx, registry, String(args.id ?? ""))
-        : name === "list_channel_messages"
-          ? await listChannelMessages(ctx, registry, String(args.channelId ?? ""), withoutChannelId(args))
+        : name === "find_channels"
+          ? await findChannels(ctx, registry, String(args.query ?? ""), Number(args.limit ?? 10))
+          : name === "list_channel_messages"
+            ? await listChannelMessages(ctx, registry, await channelIdFromArgs(ctx, args), withoutChannelLookup(args))
           : { error: "tool_not_found" };
     return rpcResult(request.id, { structuredContent: data, content: [{ type: "text", text: JSON.stringify(data) }] });
   }
@@ -208,8 +210,14 @@ function rpcResult(id: unknown, result: unknown) {
   return { jsonrpc: "2.0", id, result };
 }
 
-function withoutChannelId(args: Record<string, string | number | boolean | undefined>) {
-  const { channelId: _channelId, ...query } = args;
+async function channelIdFromArgs(ctx: { config: typeof config; store: Store; userId: number; connectionId: number; statelessToken?: TokenRow }, args: Record<string, string | number | boolean | undefined>) {
+  if (args.channelId) return String(args.channelId);
+  const found = await findChannels(ctx, registry, String(args.channelName ?? ""), 1);
+  return found.channels[0]?.id ?? "";
+}
+
+function withoutChannelLookup(args: Record<string, string | number | boolean | undefined>) {
+  const { channelId: _channelId, channelName: _channelName, ...query } = args;
   return query;
 }
 
@@ -230,12 +238,20 @@ function chatGptTools() {
       annotations: { readOnlyHint: true }
     },
     {
+      name: "find_channels",
+      description: "Find traQ channels by name or path.",
+      inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "number" } }, required: ["query"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { channels: { type: "array", items: { type: "object", properties: { id: { type: "string" }, name: { type: "string" }, path: { type: "string" }, parentId: { type: "string" } }, required: ["id", "name", "path"], additionalProperties: false } } }, required: ["channels"], additionalProperties: false },
+      annotations: { readOnlyHint: true }
+    },
+    {
       name: "list_channel_messages",
       description: "List messages in one traQ channel.",
       inputSchema: {
         type: "object",
         properties: {
           channelId: { type: "string" },
+          channelName: { type: "string" },
           limit: { type: "number" },
           offset: { type: "number" },
           order: { type: "string" },
@@ -245,7 +261,7 @@ function chatGptTools() {
         required: ["channelId"],
         additionalProperties: false
       },
-      outputSchema: { type: "object", properties: { messages: { type: "array", items: { type: "object", additionalProperties: true } }, status: { type: "number" } }, required: ["messages"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { messages: { type: "array", items: { type: "object", additionalProperties: true } }, status: { type: "number" }, error: { type: "string" } }, required: ["messages"], additionalProperties: false },
       annotations: { readOnlyHint: true }
     }
   ];
