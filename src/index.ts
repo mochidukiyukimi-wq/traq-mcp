@@ -6,7 +6,7 @@ import { getCookie, setCookie } from "hono/cookie";
 import { loadConfig } from "./config.js";
 import { decryptText, encryptText, hashSecret } from "./crypto.js";
 import { Store, type TokenRow } from "./db.js";
-import { createMcpServer, fetchMessage, searchMessages } from "./mcp.js";
+import { createMcpServer, fetchMessage, listChannelMessages, searchMessages } from "./mcp.js";
 import { isBlockedEndpoint, loadRegistry } from "./registry.js";
 import { exchangeCode, getMe, hasReadScope, tokenRow } from "./traq.js";
 
@@ -196,7 +196,9 @@ async function chatGptRpc(request: any, userId: number, connectionId: number, st
       ? await searchMessages(ctx, registry, String(args.query ?? ""))
       : name === "fetch"
         ? await fetchMessage(ctx, registry, String(args.id ?? ""))
-        : { error: "tool_not_found" };
+        : name === "list_channel_messages"
+          ? await listChannelMessages(ctx, registry, String(args.channelId ?? ""), withoutChannelId(args))
+          : { error: "tool_not_found" };
     return rpcResult(request.id, { structuredContent: data, content: [{ type: "text", text: JSON.stringify(data) }] });
   }
   return { jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } };
@@ -204,6 +206,11 @@ async function chatGptRpc(request: any, userId: number, connectionId: number, st
 
 function rpcResult(id: unknown, result: unknown) {
   return { jsonrpc: "2.0", id, result };
+}
+
+function withoutChannelId(args: Record<string, string | number | boolean | undefined>) {
+  const { channelId: _channelId, ...query } = args;
+  return query;
 }
 
 function chatGptTools() {
@@ -220,6 +227,25 @@ function chatGptTools() {
       description: "Fetch one traQ message by ID.",
       inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
       outputSchema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, text: { type: "string" }, url: { type: "string" }, metadata: { type: "object" } }, required: ["id", "title", "text", "url"], additionalProperties: false },
+      annotations: { readOnlyHint: true }
+    },
+    {
+      name: "list_channel_messages",
+      description: "List messages in one traQ channel.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channelId: { type: "string" },
+          limit: { type: "number" },
+          offset: { type: "number" },
+          order: { type: "string" },
+          since: { type: "string" },
+          until: { type: "string" }
+        },
+        required: ["channelId"],
+        additionalProperties: false
+      },
+      outputSchema: { type: "object", properties: { messages: { type: "array", items: { type: "object", additionalProperties: true } }, status: { type: "number" } }, required: ["messages"], additionalProperties: false },
       annotations: { readOnlyHint: true }
     }
   ];

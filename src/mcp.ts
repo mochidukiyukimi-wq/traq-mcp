@@ -63,6 +63,14 @@ export async function fetchMessage(ctx: TraqContext, registry: Map<string, Endpo
   };
 }
 
+export async function listChannelMessages(ctx: TraqContext, registry: Map<string, Endpoint>, channelId: string, query: Record<string, string | number | boolean | undefined> = {}) {
+  const endpoint = registry.get("/channels/{channelId}/messages");
+  if (!endpoint) return { messages: [] };
+  const result = await traqGet(ctx, endpoint, { channelId }, query);
+  ctx.store.logTool(ctx.connectionId, "list_channel_messages", "/channels/{channelId}/messages", result.status, result.resultCount);
+  return { messages: Array.isArray(result.body) ? result.body : [], status: result.status };
+}
+
 export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number, chatGptOnly = false, statelessToken?: TokenRow): McpServer {
   const ctx = { config, store, userId, connectionId, statelessToken };
   const server = new McpServer({ name: "traQ MCP", version: "0.1.0" });
