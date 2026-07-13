@@ -3,6 +3,7 @@ import { serve } from "@hono/node-server";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { Hono, type Context } from "hono";
 import { getCookie, setCookie } from "hono/cookie";
+import { chatGptTools } from "./chatgpt-tools.js";
 import { loadConfig } from "./config.js";
 import { decryptText, encryptText, hashSecret } from "./crypto.js";
 import { Store, type TokenRow } from "./db.js";
@@ -70,7 +71,7 @@ app.get("/dashboard", c => {
   const sealedKey = getCookie(c, "sealed_mcp_key");
   const visibleKey = sealedKey ?? (connection?.is_active ? newKey : undefined);
   const mcpUrl = visibleKey ? `${config.publicBaseUrl}/mcp/${visibleKey}` : "key is hidden; register again if needed";
-  const chatGptUrl = visibleKey ? `${config.publicBaseUrl}/chatgpt/${visibleKey}` : "key is hidden; register again if needed";
+  const chatGptUrl = visibleKey ? `${config.publicBaseUrl}/chatgpt-v2/${visibleKey}` : "key is hidden; register again if needed";
   return c.html(html(`
     <h1>traQ Reader MCP</h1>
     <p>ユーザー: ${escapeHtml(user.traq_name)}</p>
@@ -92,7 +93,7 @@ app.post("/dashboard/key/regenerate", c => {
   store.regenerateConnection(user.id, config.mcpKeyPrefix);
   const key = sealConnection(store.getTokens(user.id));
   const mcpUrl = `${config.publicBaseUrl}/mcp/${key}`;
-  const chatGptUrl = `${config.publicBaseUrl}/chatgpt/${key}`;
+  const chatGptUrl = `${config.publicBaseUrl}/chatgpt-v2/${key}`;
   return c.html(html(`
     <h1>traQ Reader MCP</h1>
     <p>新しいMCP Server URLです。この画面を離れるとkeyは再表示できません。</p>
@@ -112,7 +113,7 @@ app.post("/dashboard/key/revoke", c => {
 });
 
 async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
-  const safePath = c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path.startsWith("/chatgpt/") ? "/chatgpt/:key" : c.req.path;
+  const safePath = safeMcpPath(c.req.path);
   console.info("mcp_request", {
     path: safePath,
     method: c.req.method,
@@ -129,7 +130,7 @@ async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
       console.info("mcp_response", { path: safePath, method: c.req.method, status: 401, auth: "invalid_key" });
       return c.json({ error: "unauthorized", message: "invalid or missing MCP key" }, 401);
     }
-    if (chatGptOnly) return handleChatGptMcp(c, 0, 0, sealed);
+    if (chatGptOnly) return handleChatGptMcp(c, 0, 0, sealed, safePath);
     const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
     const server = createMcpServer(config, store, registry, 0, 0, chatGptOnly, sealed);
     await server.connect(transport);
@@ -138,13 +139,13 @@ async function handleMcp(c: Context, key?: string, chatGptOnly = false) {
     return response;
   }
   store.touchConnection(connection.id);
-  if (chatGptOnly) return handleChatGptMcp(c, connection.user_id, connection.id);
+  if (chatGptOnly) return handleChatGptMcp(c, connection.user_id, connection.id, undefined, safePath);
   const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
   const server = createMcpServer(config, store, registry, connection.user_id, connection.id, chatGptOnly);
   await server.connect(transport);
   const response = await transport.handleRequest(mcpRequest(c.req.raw));
   console.info("mcp_response", {
-    path: c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path.startsWith("/chatgpt/") ? "/chatgpt/:key" : c.req.path,
+    path: safePath,
     method: c.req.method,
     status: response.status
   });
@@ -155,16 +156,18 @@ app.all("/mcp", c => handleMcp(c, c.req.query("key")));
 app.all("/mcp/:key", c => handleMcp(c, c.req.param("key")));
 app.options("/chatgpt/:key", c => new Response(null, { status: 204 }));
 app.all("/chatgpt/:key", c => handleMcp(c, c.req.param("key"), true));
+app.options("/chatgpt-v2/:key", c => new Response(null, { status: 204 }));
+app.all("/chatgpt-v2/:key", c => handleMcp(c, c.req.param("key"), true));
 
-async function handleChatGptMcp(c: Context, userId: number, connectionId: number, statelessToken?: TokenRow) {
+async function handleChatGptMcp(c: Context, userId: number, connectionId: number, statelessToken?: TokenRow, safePath = "/chatgpt/:key") {
   if (c.req.method === "GET") {
-    console.info("mcp_response", { path: "/chatgpt/:key", method: c.req.method, status: 200, rpc: "sse_probe" });
+    console.info("mcp_response", { path: safePath, method: c.req.method, status: 200, rpc: "sse_probe" });
     return c.json({ ok: true, tools: chatGptTools() });
   }
   const request = await readRpc(c.req.raw);
   const response = await chatGptRpc(request, userId, connectionId, statelessToken);
   const status = response ? 200 : 202;
-  console.info("mcp_response", { path: "/chatgpt/:key", method: c.req.method, status, rpc: request?.method ?? "batch" });
+  console.info("mcp_response", { path: safePath, method: c.req.method, status, rpc: request?.method ?? "batch" });
   return response ? c.json(response, status) : new Response(null, { status });
 }
 
@@ -185,7 +188,7 @@ async function chatGptRpc(request: any, userId: number, connectionId: number, st
     return rpcResult(request.id, {
       protocolVersion: request.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "traQ Reader MCP", version: "0.2.0" }
+      serverInfo: { name: "traQ Reader MCP", version: "0.3.0" }
     });
   }
   if (request.method === "tools/list") return rpcResult(request.id, { tools: chatGptTools() });
@@ -205,123 +208,6 @@ async function chatGptRpc(request: any, userId: number, connectionId: number, st
 
 function rpcResult(id: unknown, result: unknown) {
   return { jsonrpc: "2.0", id, result };
-}
-
-function chatGptTools() {
-  const filterProperties = {
-    channelId: { type: "string" },
-    channelPath: { type: "string" },
-    userId: { type: "string" },
-    username: { type: "string" },
-    after: { type: "string", format: "date-time" },
-    before: { type: "string", format: "date-time" },
-    limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
-    cursor: { type: "string" },
-    order: { type: "string", enum: ["asc", "desc"], default: "desc" },
-    includeBots: { type: "boolean", default: false }
-  };
-  const user = {
-    type: "object",
-    properties: { id: { type: "string" }, username: { type: "string" }, displayName: { type: "string" }, isBot: { type: "boolean" } },
-    required: ["id", "username"],
-    additionalProperties: false
-  };
-  const channel = {
-    type: "object",
-    properties: { id: { type: "string" }, path: { type: "string" }, name: { type: "string" }, parentId: { type: "string" } },
-    required: ["id", "path"],
-    additionalProperties: false
-  };
-  const message = {
-    type: "object",
-    properties: {
-      id: { type: "string" }, text: { type: "string" }, renderedText: { type: "string" }, user, channel,
-      createdAt: { type: "string" }, updatedAt: { type: "string" }, parentMessageId: { type: "string" }, threadId: { type: "string" },
-      url: { type: "string" }, attachments: { type: "array", items: { type: "object", additionalProperties: true } },
-      stamps: { type: "array", items: {} }
-    },
-    required: ["id", "text", "user", "channel", "createdAt", "url", "attachments", "stamps"],
-    additionalProperties: false
-  };
-  const appliedFilters = {
-    type: "object",
-    properties: { ...filterProperties },
-    required: ["order", "includeBots"],
-    additionalProperties: false
-  };
-  const page = {
-    type: "object",
-    properties: { messages: { type: "array", items: message }, nextCursor: { type: "string" }, appliedFilters },
-    required: ["messages", "appliedFilters"],
-    additionalProperties: false
-  };
-  return [
-    {
-      name: "search",
-      description: "Compatibility search. Use structured username/userId, channelPath/channelId, after, before and includeBots arguments; never put from: or in: filters inside query.",
-      inputSchema: { type: "object", properties: { query: { type: "string" }, ...filterProperties }, required: ["query"], additionalProperties: false },
-      outputSchema: {
-        type: "object",
-        properties: {
-          results: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, userId: { type: "string" }, channelId: { type: "string" }, createdAt: { type: "string" } }, required: ["id", "title", "url", "userId", "channelId", "createdAt"], additionalProperties: false } },
-          nextCursor: { type: "string" },
-          appliedFilters
-        },
-        required: ["results", "appliedFilters"],
-        additionalProperties: false
-      },
-      annotations: { readOnlyHint: true }
-    },
-    {
-      name: "fetch",
-      description: "Compatibility fetch. Use fetch_message for the common normalized Message type.",
-      inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
-      outputSchema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, text: { type: "string" }, url: { type: "string" }, metadata: message }, required: ["id", "title", "text", "url", "metadata"], additionalProperties: false },
-      annotations: { readOnlyHint: true }
-    },
-    {
-      name: "resolve_user",
-      description: "Resolve an exact traQ username to userId. Fails with user_not_found instead of running an unrelated search.",
-      inputSchema: { type: "object", properties: { username: { type: "string" } }, required: ["username"], additionalProperties: false },
-      outputSchema: user,
-      annotations: { readOnlyHint: true }
-    },
-    {
-      name: "resolve_channel",
-      description: "Resolve an exact human-readable traQ channel path to channelId. Fails with channel_not_found on failure.",
-      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false },
-      outputSchema: channel,
-      annotations: { readOnlyHint: true }
-    },
-    {
-      name: "list_messages",
-      description: "List traQ history. Specify user, channel, period and order as structured arguments. Every returned message is re-verified against appliedFilters.",
-      inputSchema: { type: "object", properties: filterProperties, additionalProperties: false },
-      outputSchema: page,
-      annotations: { readOnlyHint: true }
-    },
-    {
-      name: "search_messages",
-      description: "Search message text with structured user, channel, period, order and bot filters. Never mix from: or in: syntax into query.",
-      inputSchema: { type: "object", properties: { query: { type: "string" }, ...filterProperties }, additionalProperties: false },
-      outputSchema: page,
-      annotations: { readOnlyHint: true }
-    },
-    {
-      name: "fetch_message",
-      description: "Fetch one message using the same normalized Message type as list_messages and search_messages.",
-      inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
-      outputSchema: message,
-      annotations: { readOnlyHint: true }
-    },
-    {
-      name: "list_channel_messages",
-      description: "Legacy alias for list_messages. Prefer channelPath/channelId structured arguments.",
-      inputSchema: { type: "object", properties: filterProperties, additionalProperties: false },
-      outputSchema: page,
-      annotations: { readOnlyHint: true }
-    }
-  ];
 }
 
 function sealConnection(row: TokenRow): string {
@@ -347,12 +233,19 @@ function mcpRequest(request: Request): Request {
 
 app.onError((err, c) => {
   const safeMessage = err instanceof Error ? err.message.split(":")[0] : "unknown";
-  console.error("request_failed", { path: c.req.path.startsWith("/mcp/") ? "/mcp/:key" : c.req.path, error: safeMessage });
+  console.error("request_failed", { path: safeMcpPath(c.req.path), error: safeMessage });
   const message = err instanceof Error && err.message === "reauth_required"
     ? { error: "reauth_required", message: "traQ OAuth token refresh failed. Please register again." }
     : { error: "internal_server_error", message: "internal server error" };
   return c.json(message, 500);
 });
+
+function safeMcpPath(path: string): string {
+  if (path.startsWith("/mcp/")) return "/mcp/:key";
+  if (path.startsWith("/chatgpt-v2/")) return "/chatgpt-v2/:key";
+  if (path.startsWith("/chatgpt/")) return "/chatgpt/:key";
+  return path;
+}
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]!));

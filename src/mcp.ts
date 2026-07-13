@@ -20,7 +20,7 @@ const structured = (value: Record<string, unknown>) => ({
 const genericInput = {
   path: z.string(),
   params: z.record(z.string(), z.string()).default({}),
-  query: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.undefined()])).default({})
+  query: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).default({})
 };
 
 const filterInput = {
@@ -28,12 +28,12 @@ const filterInput = {
   channelPath: z.string().optional(),
   userId: z.string().optional(),
   username: z.string().optional(),
-  after: z.string().optional(),
-  before: z.string().optional(),
-  limit: z.number().int().min(1).max(200).optional(),
+  after: z.iso.datetime().optional(),
+  before: z.iso.datetime().optional(),
+  limit: z.number().int().min(1).max(200).default(50),
   cursor: z.string().optional(),
-  order: z.enum(["asc", "desc"]).optional(),
-  includeBots: z.boolean().optional()
+  order: z.enum(["asc", "desc"]).default("desc"),
+  includeBots: z.boolean().default(false)
 };
 
 const userSchema = z.object({
@@ -181,11 +181,14 @@ function toolHandler(ctx: TraqContext, registry: Map<string, Endpoint>, name: st
 
 export function createMcpServer(config: Config, store: Store, registry: Map<string, Endpoint>, userId: number, connectionId: number, chatGptOnly = false, statelessToken?: TokenRow): McpServer {
   const ctx = { config, store, userId, connectionId, statelessToken };
-  const server = new McpServer({ name: "traQ Reader MCP", version: "0.2.0" });
+  const server = new McpServer({ name: "traQ Reader MCP", version: "0.3.0" });
 
   server.registerTool("search", {
     description: "Compatibility search. Use structured username/userId, channelPath/channelId, after, before and includeBots arguments; do not put from: or in: syntax in query.",
-    inputSchema: { query: z.string(), ...filterInput },
+    inputSchema: {
+      query: z.string().describe("Optional plain-text keyword query. Do not put from: or in: filters here.").optional(),
+      ...filterInput
+    },
     annotations: readOnly
   }, toolHandler(ctx, registry, "search") as any);
 
