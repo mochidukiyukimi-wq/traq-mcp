@@ -6,7 +6,7 @@ import { getCookie, setCookie } from "hono/cookie";
 import { loadConfig } from "./config.js";
 import { decryptText, encryptText, hashSecret } from "./crypto.js";
 import { Store, type TokenRow } from "./db.js";
-import { createMcpServer, fetchMessage, findChannels, listChannelMessages, searchMessages } from "./mcp.js";
+import { createMcpServer, executeReaderTool, readerError } from "./mcp.js";
 import { isBlockedEndpoint, loadRegistry } from "./registry.js";
 import { exchangeCode, getMe, hasReadScope, tokenRow } from "./traq.js";
 
@@ -16,11 +16,11 @@ const registry = await loadRegistry(config.traqOpenApiUrl);
 const app = new Hono();
 const secureCookie = config.publicBaseUrl.startsWith("https://");
 
-const html = (body: string) => `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>traQ MCP</title><style>body{font-family:system-ui,sans-serif;max-width:760px;margin:48px auto;padding:0 20px;line-height:1.6}button,a.button{display:inline-block;padding:10px 14px;border:1px solid #222;border-radius:6px;background:#222;color:white;text-decoration:none}code,input{font:inherit}input{width:100%;padding:10px}</style></head><body>${body}</body></html>`;
+const html = (body: string) => `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>traQ Reader MCP</title><style>body{font-family:system-ui,sans-serif;max-width:760px;margin:48px auto;padding:0 20px;line-height:1.6}button,a.button{display:inline-block;padding:10px 14px;border:1px solid #222;border-radius:6px;background:#222;color:white;text-decoration:none}code,input{font:inherit}input{width:100%;padding:10px;box-sizing:border-box}label{display:block;margin-top:16px}</style></head><body>${body}</body></html>`;
 
 app.get("/", c => c.html(html(`
-  <h1>traQ MCP</h1>
-  <p>traQ MCP は、あなたのtraQアカウントでread scopeにより読める情報を、MCPクライアントから取得できるようにするツールです。投稿・編集・削除などのwrite操作はできません。</p>
+  <h1>traQ Reader MCP</h1>
+  <p>traQのread権限で、チャンネル・投稿者・期間を指定した投稿履歴の取得と検索ができます。投稿・編集・削除などのwrite操作はできません。</p>
   <p>MCP URLを追加したクライアントは、あなたのtraQ read権限で情報を取得できます。URLを他人に共有しないでください。OAuth2・token・client管理系の情報は公開しません。</p>
   <p><a class="button" href="/auth/traq/start">traQで登録</a></p>
 `)));
@@ -72,7 +72,7 @@ app.get("/dashboard", c => {
   const mcpUrl = visibleKey ? `${config.publicBaseUrl}/mcp/${visibleKey}` : "key is hidden; register again if needed";
   const chatGptUrl = visibleKey ? `${config.publicBaseUrl}/chatgpt/${visibleKey}` : "key is hidden; register again if needed";
   return c.html(html(`
-    <h1>traQ MCP</h1>
+    <h1>traQ Reader MCP</h1>
     <p>ユーザー: ${escapeHtml(user.traq_name)}</p>
     <label>MCP Server URL</label>
     <input readonly value="${escapeHtml(mcpUrl)}">
@@ -94,7 +94,7 @@ app.post("/dashboard/key/regenerate", c => {
   const mcpUrl = `${config.publicBaseUrl}/mcp/${key}`;
   const chatGptUrl = `${config.publicBaseUrl}/chatgpt/${key}`;
   return c.html(html(`
-    <h1>traQ MCP</h1>
+    <h1>traQ Reader MCP</h1>
     <p>新しいMCP Server URLです。この画面を離れるとkeyは再表示できません。</p>
     <input readonly value="${escapeHtml(mcpUrl)}">
     <p>ChatGPT Connector URL</p>
@@ -185,23 +185,20 @@ async function chatGptRpc(request: any, userId: number, connectionId: number, st
     return rpcResult(request.id, {
       protocolVersion: request.params?.protocolVersion ?? "2025-03-26",
       capabilities: { tools: {} },
-      serverInfo: { name: "traQ MCP", version: "0.1.0" }
+      serverInfo: { name: "traQ Reader MCP", version: "0.2.0" }
     });
   }
   if (request.method === "tools/list") return rpcResult(request.id, { tools: chatGptTools() });
   if (request.method === "tools/call") {
     const name = request.params?.name;
     const args = request.params?.arguments ?? {};
-    const data = name === "search"
-      ? await searchMessages(ctx, registry, String(args.query ?? ""))
-      : name === "fetch"
-        ? await fetchMessage(ctx, registry, String(args.id ?? ""))
-        : name === "find_channels"
-          ? await findChannels(ctx, registry, String(args.query ?? ""), Number(args.limit ?? 10))
-          : name === "list_channel_messages"
-            ? await listChannelMessages(ctx, registry, await channelIdFromArgs(ctx, args), withoutChannelLookup(args))
-          : { error: "tool_not_found" };
-    return rpcResult(request.id, { structuredContent: data, content: [{ type: "text", text: JSON.stringify(data) }] });
+    try {
+      const data = await executeReaderTool(ctx, registry, String(name ?? ""), args);
+      return rpcResult(request.id, { structuredContent: data, content: [{ type: "text", text: JSON.stringify(data) }] });
+    } catch (error) {
+      const data = readerError(error);
+      return rpcResult(request.id, { isError: true, structuredContent: data, content: [{ type: "text", text: JSON.stringify(data) }] });
+    }
   }
   return { jsonrpc: "2.0", id: request.id, error: { code: -32601, message: "Method not found" } };
 }
@@ -210,58 +207,118 @@ function rpcResult(id: unknown, result: unknown) {
   return { jsonrpc: "2.0", id, result };
 }
 
-async function channelIdFromArgs(ctx: { config: typeof config; store: Store; userId: number; connectionId: number; statelessToken?: TokenRow }, args: Record<string, string | number | boolean | undefined>) {
-  if (args.channelId) return String(args.channelId);
-  const found = await findChannels(ctx, registry, String(args.channelName ?? ""), 1);
-  return found.channels[0]?.id ?? "";
-}
-
-function withoutChannelLookup(args: Record<string, string | number | boolean | undefined>) {
-  const { channelId: _channelId, channelName: _channelName, ...query } = args;
-  return query;
-}
-
 function chatGptTools() {
+  const filterProperties = {
+    channelId: { type: "string" },
+    channelPath: { type: "string" },
+    userId: { type: "string" },
+    username: { type: "string" },
+    after: { type: "string", format: "date-time" },
+    before: { type: "string", format: "date-time" },
+    limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+    cursor: { type: "string" },
+    order: { type: "string", enum: ["asc", "desc"], default: "desc" },
+    includeBots: { type: "boolean", default: false }
+  };
+  const user = {
+    type: "object",
+    properties: { id: { type: "string" }, username: { type: "string" }, displayName: { type: "string" }, isBot: { type: "boolean" } },
+    required: ["id", "username"],
+    additionalProperties: false
+  };
+  const channel = {
+    type: "object",
+    properties: { id: { type: "string" }, path: { type: "string" }, name: { type: "string" }, parentId: { type: "string" } },
+    required: ["id", "path"],
+    additionalProperties: false
+  };
+  const message = {
+    type: "object",
+    properties: {
+      id: { type: "string" }, text: { type: "string" }, renderedText: { type: "string" }, user, channel,
+      createdAt: { type: "string" }, updatedAt: { type: "string" }, parentMessageId: { type: "string" }, threadId: { type: "string" },
+      url: { type: "string" }, attachments: { type: "array", items: { type: "object", additionalProperties: true } },
+      stamps: { type: "array", items: {} }
+    },
+    required: ["id", "text", "user", "channel", "createdAt", "url", "attachments", "stamps"],
+    additionalProperties: false
+  };
+  const appliedFilters = {
+    type: "object",
+    properties: { ...filterProperties },
+    required: ["order", "includeBots"],
+    additionalProperties: false
+  };
+  const page = {
+    type: "object",
+    properties: { messages: { type: "array", items: message }, nextCursor: { type: "string" }, appliedFilters },
+    required: ["messages", "appliedFilters"],
+    additionalProperties: false
+  };
   return [
     {
       name: "search",
-      description: "Search traQ messages.",
-      inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"], additionalProperties: false },
-      outputSchema: { type: "object", properties: { results: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" } }, required: ["id", "title", "url"], additionalProperties: false } } }, required: ["results"], additionalProperties: false },
+      description: "Compatibility search. Use structured username/userId, channelPath/channelId, after, before and includeBots arguments; never put from: or in: filters inside query.",
+      inputSchema: { type: "object", properties: { query: { type: "string" }, ...filterProperties }, required: ["query"], additionalProperties: false },
+      outputSchema: {
+        type: "object",
+        properties: {
+          results: { type: "array", items: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, url: { type: "string" }, userId: { type: "string" }, channelId: { type: "string" }, createdAt: { type: "string" } }, required: ["id", "title", "url", "userId", "channelId", "createdAt"], additionalProperties: false } },
+          nextCursor: { type: "string" },
+          appliedFilters
+        },
+        required: ["results", "appliedFilters"],
+        additionalProperties: false
+      },
       annotations: { readOnlyHint: true }
     },
     {
       name: "fetch",
-      description: "Fetch one traQ message by ID.",
+      description: "Compatibility fetch. Use fetch_message for the common normalized Message type.",
       inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
-      outputSchema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, text: { type: "string" }, url: { type: "string" }, metadata: { type: "object" } }, required: ["id", "title", "text", "url"], additionalProperties: false },
+      outputSchema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, text: { type: "string" }, url: { type: "string" }, metadata: message }, required: ["id", "title", "text", "url", "metadata"], additionalProperties: false },
       annotations: { readOnlyHint: true }
     },
     {
-      name: "find_channels",
-      description: "Find traQ channels by name or path.",
-      inputSchema: { type: "object", properties: { query: { type: "string" }, limit: { type: "number" } }, required: ["query"], additionalProperties: false },
-      outputSchema: { type: "object", properties: { channels: { type: "array", items: { type: "object", properties: { id: { type: "string" }, name: { type: "string" }, path: { type: "string" }, parentId: { type: "string" } }, required: ["id", "name", "path"], additionalProperties: false } } }, required: ["channels"], additionalProperties: false },
+      name: "resolve_user",
+      description: "Resolve an exact traQ username to userId. Fails with user_not_found instead of running an unrelated search.",
+      inputSchema: { type: "object", properties: { username: { type: "string" } }, required: ["username"], additionalProperties: false },
+      outputSchema: user,
+      annotations: { readOnlyHint: true }
+    },
+    {
+      name: "resolve_channel",
+      description: "Resolve an exact human-readable traQ channel path to channelId. Fails with channel_not_found on failure.",
+      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"], additionalProperties: false },
+      outputSchema: channel,
+      annotations: { readOnlyHint: true }
+    },
+    {
+      name: "list_messages",
+      description: "List traQ history. Specify user, channel, period and order as structured arguments. Every returned message is re-verified against appliedFilters.",
+      inputSchema: { type: "object", properties: filterProperties, additionalProperties: false },
+      outputSchema: page,
+      annotations: { readOnlyHint: true }
+    },
+    {
+      name: "search_messages",
+      description: "Search message text with structured user, channel, period, order and bot filters. Never mix from: or in: syntax into query.",
+      inputSchema: { type: "object", properties: { query: { type: "string" }, ...filterProperties }, additionalProperties: false },
+      outputSchema: page,
+      annotations: { readOnlyHint: true }
+    },
+    {
+      name: "fetch_message",
+      description: "Fetch one message using the same normalized Message type as list_messages and search_messages.",
+      inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
+      outputSchema: message,
       annotations: { readOnlyHint: true }
     },
     {
       name: "list_channel_messages",
-      description: "List messages in one traQ channel.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          channelId: { type: "string" },
-          channelName: { type: "string" },
-          limit: { type: "number" },
-          offset: { type: "number" },
-          order: { type: "string" },
-          since: { type: "string" },
-          until: { type: "string" }
-        },
-        required: ["channelId"],
-        additionalProperties: false
-      },
-      outputSchema: { type: "object", properties: { messages: { type: "array", items: { type: "object", additionalProperties: true } }, status: { type: "number" }, error: { type: "string" } }, required: ["messages"], additionalProperties: false },
+      description: "Legacy alias for list_messages. Prefer channelPath/channelId structured arguments.",
+      inputSchema: { type: "object", properties: filterProperties, additionalProperties: false },
+      outputSchema: page,
       annotations: { readOnlyHint: true }
     }
   ];
@@ -301,7 +358,7 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]!));
 }
 
-console.log(`traQ MCP listening on http://localhost:${config.port}`);
+console.log(`traQ Reader MCP listening on http://localhost:${config.port}`);
 console.log(`loaded ${registry.size} traQ GET endpoints`);
 serve({ fetch: app.fetch, port: config.port });
 

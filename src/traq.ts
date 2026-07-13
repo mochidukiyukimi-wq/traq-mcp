@@ -91,12 +91,13 @@ export async function traqGet(
   endpoint: Endpoint,
   params: Record<string, string>,
   query: Record<string, string | number | boolean | undefined>
-): Promise<{ status: number; body: unknown; resultCount?: number }> {
+): Promise<{ status: number; body: unknown; resultCount?: number; headers: Record<string, string> }> {
   const limit = query.limit;
   if (ctx.config.mcpHardMaxLimit !== undefined && limit !== undefined && Number(limit) > ctx.config.mcpHardMaxLimit) {
     return {
       status: 400,
-      body: { error: "limit_too_large", message: "limit is larger than MCP_HARD_MAX_LIMIT", maxLimit: ctx.config.mcpHardMaxLimit }
+      body: { error: "limit_too_large", message: "limit is larger than MCP_HARD_MAX_LIMIT", maxLimit: ctx.config.mcpHardMaxLimit },
+      headers: {}
     };
   }
   const url = new URL(`${ctx.config.traqApiBaseUrl}${fillPath(endpoint.path, params)}`);
@@ -105,9 +106,15 @@ export async function traqGet(
   }
   const response = await fetch(url, { headers: { authorization: `Bearer ${await accessToken(ctx)}` } });
   const text = await response.text();
-  const body = text ? JSON.parse(text) : null;
-  if (response.status === 401 || response.status === 403) {
-    return { status: response.status, body: { error: "traq_api_error", status: response.status, message: `traQ API returned ${response.status}` } };
+  let body: unknown = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
   }
-  return { status: response.status, body, resultCount: Array.isArray(body) ? body.length : undefined };
+  const headers = Object.fromEntries(response.headers.entries());
+  if (response.status === 401 || response.status === 403) {
+    return { status: response.status, body: { error: "traq_api_error", status: response.status, message: `traQ API returned ${response.status}` }, headers };
+  }
+  return { status: response.status, body, resultCount: Array.isArray(body) ? body.length : undefined, headers };
 }

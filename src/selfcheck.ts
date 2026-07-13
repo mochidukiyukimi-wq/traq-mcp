@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { flattenChannels } from "./mcp.js";
 import { buildRegistry, fillPath, isBlockedEndpoint } from "./registry.js";
 import { hasReadScope, tokenRow } from "./traq.js";
 
@@ -23,9 +22,5 @@ assert.equal(fillPath("/channels/{channelId}/messages", { channelId: "a b" }), "
 assert.equal(hasReadScope("read"), true);
 assert.equal(hasReadScope("openid read"), true);
 assert.equal(hasReadScope("write"), false);
-assert.deepEqual(flattenChannels([{ id: "1", name: "general" }, { id: "2", name: "random", parentId: "1" }]), [
-  { id: "1", name: "general", parentId: undefined, path: "general" },
-  { id: "2", name: "random", parentId: "1", path: "general/random" }
-]);
 assert.doesNotThrow(() => tokenRow({ tokenEncryptionKey: Buffer.alloc(32) } as any, 1, { access_token: "a" }));
 console.log("selfcheck ok");
