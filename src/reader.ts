@@ -141,11 +141,19 @@ export class TraqReader {
   private async queryMessages(query: string | undefined, input: MessageFiltersInput): Promise<MessagePage> {
     const { applied, limit } = await this.resolveFilters(input);
     const fingerprint = cursorFingerprint({ query: query ?? null, ...applied });
-    let offset = decodeCursor(input.cursor, fingerprint);
+    if (!query && applied.channelId) return this.queryChannelTimeline(applied, limit, input.cursor, fingerprint);
+    return this.querySearchIndex(query, applied, limit, input.cursor, fingerprint);
+  }
+
+  private async querySearchIndex(query: string | undefined, applied: AppliedFilters, limit: number, cursor: string | undefined, fingerprint: string): Promise<MessagePage> {
+    let offset = decodeCursor(cursor, fingerprint);
     const messages: ReaderMessage[] = [];
     let totalHits = 0;
 
     while (messages.length < limit) {
+      if (offset > 9900) {
+        throw new ReaderError("pagination_limit_reached", "traQ search API cannot page beyond 10,000 hits for one query", 400);
+      }
       const pageLimit = Math.min(100, limit - messages.length);
       const result = await this.get("/messages", {}, {
         word: query || undefined,
@@ -183,6 +191,57 @@ export class TraqReader {
     return {
       messages,
       ...(offset < totalHits ? { nextCursor: encodeCursor(offset, fingerprint) } : {}),
+      appliedFilters: applied
+    };
+  }
+
+  private async queryChannelTimeline(applied: AppliedFilters, limit: number, cursor: string | undefined, fingerprint: string): Promise<MessagePage> {
+    let offset = decodeCursor(cursor, fingerprint);
+    const messages: ReaderMessage[] = [];
+    let hasMore = true;
+
+    while (messages.length < limit && hasMore) {
+      const result = await this.get("/channels/{channelId}/messages", { channelId: applied.channelId! }, {
+        limit: 200,
+        offset,
+        since: applied.after,
+        until: applied.before,
+        inclusive: false,
+        order: applied.order
+      });
+      this.assertApiSuccess(result, "channel messages", { channelId: applied.channelId });
+      if (!Array.isArray(result.body)) throw new ReaderError("invalid_api_response", "traQ API returned an invalid channel timeline", 502);
+      const rawMessages = result.body as RawMessage[];
+      if (rawMessages.length === 0) {
+        hasMore = false;
+        break;
+      }
+      const normalized = await Promise.all(rawMessages.map(message => this.normalizeMessage(message)));
+      this.verifyMessages(normalized, { ...applied, userId: undefined, username: undefined, includeBots: true });
+
+      hasMore = result.headers?.["x-traq-more"] === "true" || rawMessages.length === 200;
+      for (let index = 0; index < normalized.length; index++) {
+        const message = normalized[index];
+        offset++;
+        if (applied.userId && message.user.id !== applied.userId) continue;
+        if (!applied.includeBots && message.user.isBot !== false) continue;
+        messages.push(message);
+        if (messages.length === limit) {
+          hasMore = index + 1 < normalized.length || hasMore;
+          break;
+        }
+      }
+    }
+
+    this.verifyMessages(messages, applied);
+    messages.sort((a, b) => {
+      const byDate = Date.parse(a.createdAt) - Date.parse(b.createdAt);
+      const ordered = byDate || a.id.localeCompare(b.id);
+      return applied.order === "asc" ? ordered : -ordered;
+    });
+    return {
+      messages,
+      ...(hasMore ? { nextCursor: encodeCursor(offset, fingerprint) } : {}),
       appliedFilters: applied
     };
   }
@@ -356,7 +415,7 @@ function decodeCursor(cursor: string | undefined, fingerprint: string): number {
   if (!cursor) return 0;
   try {
     const value = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
-    if (value?.v !== 1 || value?.fingerprint !== fingerprint || !Number.isInteger(value?.offset) || value.offset < 0 || value.offset > 9900) {
+    if (value?.v !== 1 || value?.fingerprint !== fingerprint || !Number.isInteger(value?.offset) || value.offset < 0) {
       throw new Error("invalid cursor");
     }
     return value.offset;

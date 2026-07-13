@@ -44,6 +44,17 @@ function fakeGet(options: FakeOptions = {}): ReaderGet {
     if (path === options.errorPath) return { status: options.errorStatus ?? 500, body: { error: "forced" }, headers: {} };
     if (path === "/users") return { status: 200, body: users, headers: {} };
     if (path === "/channels") return { status: 200, body: { public: channels }, headers: {} };
+    if (path === "/channels/{channelId}/messages") {
+      let hits = [...source];
+      if (!options.ignoreChannelFilter) hits = hits.filter(message => message.channelId === params.channelId);
+      if (query.since) hits = hits.filter(message => Date.parse(String(message.createdAt)) > Date.parse(String(query.since)));
+      if (query.until) hits = hits.filter(message => Date.parse(String(message.createdAt)) < Date.parse(String(query.until)));
+      hits.sort((a, b) => (query.order === "asc" ? 1 : -1) * (Date.parse(String(a.createdAt)) - Date.parse(String(b.createdAt))));
+      const offset = Number(query.offset ?? 0);
+      const limit = Number(query.limit ?? 200);
+      const page = hits.slice(offset, offset + limit);
+      return { status: 200, body: page, headers: { "x-traq-more": String(offset + page.length < hits.length) } };
+    }
     if (path === "/messages/{messageId}") {
       const found = source.find(message => message.id === params.messageId);
       return found ? { status: 200, body: found, headers: {} } : { status: 404, body: null, headers: {} };
@@ -192,7 +203,7 @@ test("15 API channel filter failure is rejected", async () => {
 
 test("16 API user filter failure is rejected", async () => {
   const reader = new TraqReader(fakeGet({ messages: [rawMessage(1, { userId: "u-other" })], ignoreUserFilter: true }));
-  assert.equal(await errorCode(reader.listMessages({ userId: "u-helgev" })), "filter_verification_failed");
+  assert.equal(await errorCode(reader.searchMessages({ userId: "u-helgev" })), "filter_verification_failed");
 });
 
 test("17 empty and long content do not depend on title truncation", async () => {
